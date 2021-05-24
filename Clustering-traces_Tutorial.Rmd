@@ -1,0 +1,214 @@
+---
+title: "Chromosome5_analysis"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This is an R markdown file for running analysis scripts to cluster data from Sawh et al 2020, specially the wild type analysis of the structure of chromosome 5.
+
+We first need to load the required libraries using calls to library(). If this is the first time running this script, you will need to install each package using install_packages().
+
+```{r}
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(R.matlab)
+library(stringr)
+library(ggplot2)
+library(patchwork)
+```
+
+Then we set the current working directory, where the raw data and associated files are located:
+
+```{r}
+setwd("/Volumes/BZ/Home/gizevo30/R_Projects/Sawh_DFISH")
+```
+
+Load in the PairNames and datasets that come from the Matlab scripts from Ahilya Sawh. We will use just the wild type chromosome 5 data.
+
+The dataset file needs to be modified so that Seurat will accept it.
+
+```{r}
+PairNames <- read.csv("raw.data/PairNamesV2.txt", header = FALSE)
+PairNames <- PairNames$V1
+
+AllStructures <- readMat("raw.data/wtAllStructures2to40.mat")[[1]]
+AllStructures[1:5,1:5]
+```
+
+The matlab file doesn't have rownames or colnames, which should correspond to the PairNames and trace IDs, respectively.
+
+We can easily add these by making the rownames equal to the PairNames and by making column names with 'paste'. This is now our input for Seurat (trace by pairname matrix).
+
+```{r}
+row.names(AllStructures) <- PairNames
+colnames(AllStructures) <- paste("wt_Chromosome", 1:ncol(AllStructures), sep = "_") # labels the columns with "wt_Chromosome_1" through "wt_Chromosome_n", where n is the number of traces
+
+AllStructures[1:5,1:5]
+```
+
+Though single-cell RNA-seq and clustering can deal with the sparse nature of the data (lots of zeros where transcripts aren't detected), we don't think this makes sense for tracing data. First of all, non-detection ~= to no expression makes sense for sequencing data, but isn't logical for tracing. The default value should be the average distance instead. Therefore, we need to replace all 0 values in the matrix with the 'non-zero average'.
+
+```{r}
+non.z.avg <- apply(AllStructures, 1, function(x) mean(x[x>0])) # this generates the non-zero average for each PairName (row)
+head(non.z.avg)
+non.z.avg[is.nan(non.z.avg)] <- 0 # in case NANs are introduced by the above
+
+# for loop to replace zero values with the non-zero average for each row
+for (j in 1:length(non.z.avg)) {
+	 AllStructures[j, AllStructures[j,] == 0] <- non.z.avg[j]
+}
+
+AllStructures[1:5,1:5]
+```
+
+Now the matrix is ready for Seurat.
+
+## Creating the Seurat object
+
+The first step is to make a Seurat object, which allows us to use all of the built-in functions for clustering and plotting. In the future it might be beneficial to write functions for doing all of the Seurat steps without Seurat. The 'min.genes' variable is the minimum number of datapoints (pairwise distances) for a trace to be included in the analysis. Too few pairs means that trace doesn't have enough information to be reliably clustered. Removes poor quality traces.
+
+```{r}
+chromo.wt <- CreateSeuratObject(AllStructures, min.genes = 6, project = "Sawh_chromosomes", add.cell.id = "wt")
+```
+
+Next we can add meta data, such as the embryonic age of the trace, experimental batch, etc.
+The chromosome ages file from Matlab can be read in the same way as the Pairnames and AllStructures data. The 'names' of the vector will also have to be renamed so they match the trace names in the Seurat object.
+
+```{r}
+# Embryo age information
+ChrAges.wt <- readMat("raw.data/wtChrAges2to40.mat")
+ChrAges.wt <- unlist(ChrAges.wt)
+names(ChrAges.wt) <- paste("wt_Chromosome", 1:length(ChrAges.wt), sep = "_")
+
+# Add Batch information
+batch <- read.csv("raw.data/ChrExpt.txt", head = F)
+colnames(batch) <- c("batch")
+batch$batch <- str_sub(batch$batch, start = 2, end = 7)
+rownames(batch) <- paste("wt_Chromosome_", rownames(batch), sep = "")
+```
+
+You can directly access the meta data of the object through the 'meta.data' slot, which is a data.frame that can be modified easily to add or remove information.
+
+We use the 'WhichCells' function from Seurat to identify the traces that were used to create the Seurat object - remember, we may have removed some traces due to too few measured Pairs (min.genes variable)
+
+```{r}
+head(chromo.wt@meta.data)
+
+chromo.wt@meta.data$chromosome_age <- ChrAges.wt[WhichCells(chromo.wt)]
+
+chromo.wt@meta.data$batch <- batch[WhichCells(chromo.wt), 1]
+```
+
+Next we normalize, find Variable Features and scale the distance values before running PCA for clustering. Seurat can find features that display a lot of variability, normally to reduce the number of 'genes' or 'features' used in PCA and clustering (since many features are not informative when measuring thousands of features). However, for traces we can also just use all pairwise distances. Either way, for Seurat to work, we have to 'FindVariableFeatures'.
+
+```{r}
+chromo.wt <- NormalizeData(object = chromo.wt, normalization.method = "LogNormalize", scale.factor = 10000)
+chromo.wt <- FindVariableFeatures(chromo.wt)
+chromo.wt <- ScaleData(object = chromo.wt, genes.use = VariableFeatures, do.par = TRUE, num.cores = 6)
+```
+Next we run PCA. This generates however many principal components that you want. The basic idea is to reduce the ~hundreds of PairNames down to fewer dimensions for clustering. For this dataset we used 20, but these should be determined empirically through trial and testing.
+
+For this, we also use all PairNames as variable features, minus those from Probe 11 (which had poor detection in the dataset). Including 11 leads to weird clustering.
+
+```{r}
+VariableFeatures <- as.vector(PairNames[!(PairNames %in% PairNames[grep("11", PairNames)])])
+
+chromo.wt <- RunPCA(object = chromo.wt, features = VariableFeatures, do.print = TRUE, pcs.print = 1:5, genes.print = 5, pcs.compute = 50)
+```
+
+Next we can find clusters. 
+
+Seurat provides statistical tests to inform you how many principal components capture the majority of variance in the data – this told us that many more than 30 PCs were significant. We used 20 principal components for the final analysis, but similar results were obtained using as low as 8 or more than 20 PCs.
+
+The Louvain algorithm, and Seurat, supports the use of a resolution parameter, which sets the ‘granularity’ of the clustering (the number of clusters in the dataset). Clustering using too low a resolution fails to identify the heterogeneity in the dataset. Clustering using too a high resolution can lead to ‘over-clustering’, where bona fide clusters are split into multiple highly similar clusters. Optimal resolution was determined through trial and error (as in scRNA-seq analyses), using low to high resolution, until all clusters represented visually distinct structures. We performed Seurat clustering using 4 resolutions (0.6, 0.8, 1.0, 1.2) and analyzed the chromosome structures for all clusters for all resolutions. Resolution 1.0 was used for all datasets, and consistently outputted clusters with the most distinct structures, with minimal over-clustering (which can be corrected by merging two highly similar sub-populations).
+
+Other variables are used to reproduce the original result (older default settings in Seurat). These can be changed. The goal is not to use specific numbers, but to find the numbers which best separate your data into clusters.
+
+We can cluster using a couple of resolutions:
+
+```{r}
+chromo.wt <- FindNeighbors(object = chromo.wt, dims = 1:20, k.param = 30, nn.eps = 0.5)
+chromo.wt <- FindClusters(object = chromo.wt, resolution = 0.25, random.seed = 0)
+chromo.wt <- FindClusters(object = chromo.wt, resolution = 0.5, random.seed = 0)
+chromo.wt <- FindClusters(object = chromo.wt, resolution = 1.0, random.seed = 0)
+chromo.wt <- FindClusters(object = chromo.wt, resolution = 1.5, random.seed = 0)
+chromo.wt <- FindClusters(object = chromo.wt, resolution = 2.0, random.seed = 0)
+chromo.wt <- FindClusters(object = chromo.wt, resolution = 2.5, random.seed = 0)
+```
+
+Next we calculate tSNE and UMAP embeddings for plotting. These are alternative dimensionality reduction techniques (a la PCA), and are only used for visualization, not clustering. Clustering is done in high dimensional PCA space.
+
+To run UMAP, you must first install the umap-learn python package (e.g. via pip install umap-learn). Details on this package can be found here: https://github.com/lmcinnes/umap. For a more in depth discussion of the mathematics underlying UMAP, see the ArXiv paper here: https://arxiv.org/abs/1802.03426.
+
+
+```{r}
+chromo.wt <- RunTSNE(object = chromo.wt, reduction = "pca", dims = 1:20, tsne.method = "Rtsne", reduction.name = "tsne", reduction.key = "tsne_", seed.use = 1, check_duplicates = F)
+chromo.wt <- RunUMAP(object = chromo.wt, reduction = "pca", dims = 1:20, reduction.name = "umap", reduction.key = "umap_", seed.use = 1, check_duplicates = F, min.dist = 0.5)
+
+```
+
+
+## Plotting data and looking at clustering results
+
+Clustering results can be examined in multiple ways. We can look at the PCs that contribute the most to clustering:
+
+```{r}
+pca_plot <- ElbowPlot(object = chromo.wt, ndims = 50, reduction = "pca") + ggtitle("PCA Elbow Plot")
+pca_plot
+```
+
+Typically you are looking for the 'elbow', where there is a clear transition between clusters with high standard deviation (across traces), and those with very little, which aren't informative for the differences between traces.
+
+We can make DimPlots next. Both to show the clusters, as well as the ages.
+
+```{r}
+chromo_res.0.5 <- DimPlot(object = chromo.wt, group.by = "RNA_snn_res.0.5", reduction = "tsne", label = T, pt.size = 1) + ggtitle("Clusters") + theme(plot.title = element_text(hjust = 0.5))
+chromo_res.1.0 <- DimPlot(object = chromo.wt, group.by = "RNA_snn_res.1", reduction = "tsne", label = T, pt.size = 1) + ggtitle("Clusters") + theme(plot.title = element_text(hjust = 0.5))
+chromo_res.2.0 <- DimPlot(object = chromo.wt, group.by = "RNA_snn_res.2", reduction = "tsne", label = T, pt.size = 1) + ggtitle("Clusters") + theme(plot.title = element_text(hjust = 0.5))
+
+chromo_age <- DimPlot(object = chromo.wt, group.by = "chromosome_age", reduction = "tsne", label = F, pt.size = 1) + ggtitle("Chromosome Age") + theme(plot.title = element_text(hjust = 0.5))
+
+chromo_batch <- DimPlot(object = chromo.wt, group.by = "batch", reduction = "tsne", label = F, pt.size = 1) + ggtitle("Batch date") + theme(plot.title = element_text(hjust = 0.5))
+
+# use patchwork package to plot them together
+chromo_res.0.5 + chromo_res.1.0 + chromo_res.2.0 + chromo_age + chromo_batch + plot_layout(ncol = 2, widths = )
+
+```
+
+From this, you can see a bunch of clusters, and that they won't really group by age or batch (traces from embryos of all ages and batches are included in each cluster).
+
+By increasing the resolution, you get more clusters, however, most are probably real clusters that have been fragmented by the higher resolution, and either represent minor differences, or noise due to technical effects (poor trace quality)
+
+We can examine the relationships between cluster IDs from different resolutions to get a sense of this using the clustree package:
+
+```{r}
+library(clustree)
+
+meta.data <- chromo.wt@meta.data[,grep("res.", colnames(chromo.wt@meta.data))]
+
+clustree(meta.data, prefix = "RNA_snn_res.", edge_width = 0.5, node_size_range = c(1,6), alt_colour = "black")
+
+```
+
+
+The criss-crossing lines above resolution 1.0 indicate unstable clustering assignments, and above 1.0 you get too few clusters (for example, cluster 0 and 1 from res 1.0).
+
+
+The next step is to take the cluster assignments from R and import them back into Matlab for making matrices, to see if the clusters actually represent anything.
+
+We have to modify the files a bit so that they work with your Matlab scripts:
+
+```{r}
+meta.data <- chromo.wt@meta.data[, grep("res.", colnames(chromo.wt@meta.data))]
+rownames(meta.data) <- str_sub(rownames(meta.data), start = 15) # remove excess info from rownames so that they match Matlab scripts
+write.csv(meta.data, file = "Chromosome_5_wt_clustering-results.csv") # saves in current directory
+```
+
