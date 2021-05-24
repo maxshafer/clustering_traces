@@ -28,7 +28,7 @@ library(patchwork)
 Then we set the current working directory, where the raw data and associated files are located:
 
 ```{r}
-setwd("/Volumes/BZ/Home/gizevo30/R_Projects/Sawh_DFISH")
+setwd("/Volumes/BZ/Home/gizevo30/R_Projects/clustering_traces") # Change this to your personal path
 ```
 
 Load in the PairNames and datasets that come from the Matlab scripts from Ahilya Sawh. We will use just the wild type chromosome 5 data.
