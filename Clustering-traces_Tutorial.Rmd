@@ -38,9 +38,13 @@ The dataset file needs to be modified so that Seurat will accept it.
 ```{r}
 PairNames <- read.csv("raw.data/PairNamesV2.txt", header = FALSE)
 PairNames <- PairNames$V1
+length(PairNames)
 
 AllStructures <- readMat("raw.data/wtAllStructures2to40.mat")[[1]]
+dim(AllStructures)
 AllStructures[1:5,1:5]
+
+length(PairNames) == nrow(AllStructures)
 ```
 
 The matlab file doesn't have rownames or colnames, which should correspond to the PairNames and trace IDs, respectively.
@@ -61,12 +65,31 @@ non.z.avg <- apply(AllStructures, 1, function(x) mean(x[x>0])) # this generates 
 head(non.z.avg)
 non.z.avg[is.nan(non.z.avg)] <- 0 # in case NANs are introduced by the above
 
+```
+
+Normally, cells (or traces) which have too little information (too few detected genes or pairwise distances) are removed during creation of the Seurat object (below). However, it is easier to do it before we make the object. Once we remove them, then we can replace the zero values with the non-zero avgs.
+
+```{r}
+# Calculate the number of pairs per trace
+numb.traces <- apply(AllStructures, 2, function(x) length(x[x>0]))
+# Plot a histogram of those numbers
+hist(numb.traces)
+```
+```{r}
+# Remove traces (columns) where fewer than the minimum number of traces were detected
+
+min.traces <- 1
+
+# Find how many traces you will remove
+paste("Analysis using min.traces =", min.traces, "removes", length(numb.traces[numb.traces < min.traces]), "traces", sep = " ")
+
+AllStructures2 <- AllStructures[,numb.traces > min.traces]
 # for loop to replace zero values with the non-zero average for each row
 for (j in 1:length(non.z.avg)) {
-	 AllStructures[j, AllStructures[j,] == 0] <- non.z.avg[j]
+	 AllStructures2[j, AllStructures2[j,] == 0] <- non.z.avg[j]
 }
 
-AllStructures[1:5,1:5]
+AllStructures2[1:5,1:5]
 ```
 
 Now the matrix is ready for Seurat.
@@ -76,7 +99,7 @@ Now the matrix is ready for Seurat.
 The first step is to make a Seurat object, which allows us to use all of the built-in functions for clustering and plotting. In the future it might be beneficial to write functions for doing all of the Seurat steps without Seurat. The 'min.genes' variable is the minimum number of datapoints (pairwise distances) for a trace to be included in the analysis. Too few pairs means that trace doesn't have enough information to be reliably clustered. Removes poor quality traces.
 
 ```{r}
-chromo.wt <- CreateSeuratObject(AllStructures, min.genes = 6, project = "Sawh_chromosomes", add.cell.id = "wt")
+chromo.wt <- CreateSeuratObject(AllStructures2, min.genes = 0, project = "Sawh_chromosomes", add.cell.id = "wt")
 ```
 
 Next we can add meta data, such as the embryonic age of the trace, experimental batch, etc.
@@ -87,12 +110,14 @@ The chromosome ages file from Matlab can be read in the same way as the Pairname
 ChrAges.wt <- readMat("raw.data/wtChrAges2to40.mat")
 ChrAges.wt <- unlist(ChrAges.wt)
 names(ChrAges.wt) <- paste("wt_Chromosome", 1:length(ChrAges.wt), sep = "_")
+head(ChrAges.wt)
 
 # Add Batch information
 batch <- read.csv("raw.data/ChrExpt.txt", head = F)
 colnames(batch) <- c("batch")
 batch$batch <- str_sub(batch$batch, start = 2, end = 7)
 rownames(batch) <- paste("wt_Chromosome_", rownames(batch), sep = "")
+head(batch)
 ```
 
 You can directly access the meta data of the object through the 'meta.data' slot, which is a data.frame that can be modified easily to add or remove information.
@@ -105,6 +130,8 @@ head(chromo.wt@meta.data)
 chromo.wt@meta.data$chromosome_age <- ChrAges.wt[WhichCells(chromo.wt)]
 
 chromo.wt@meta.data$batch <- batch[WhichCells(chromo.wt), 1]
+
+head(chromo.wt@meta.data)
 ```
 
 Next we normalize, find Variable Features and scale the distance values before running PCA for clustering. Seurat can find features that display a lot of variability, normally to reduce the number of 'genes' or 'features' used in PCA and clustering (since many features are not informative when measuring thousands of features). However, for traces we can also just use all pairwise distances. Either way, for Seurat to work, we have to 'FindVariableFeatures'.
@@ -112,13 +139,14 @@ Next we normalize, find Variable Features and scale the distance values before r
 ```{r}
 chromo.wt <- NormalizeData(object = chromo.wt, normalization.method = "LogNormalize", scale.factor = 10000)
 chromo.wt <- FindVariableFeatures(chromo.wt)
-chromo.wt <- ScaleData(object = chromo.wt, genes.use = VariableFeatures, do.par = TRUE, num.cores = 6)
+chromo.wt <- ScaleData(object = chromo.wt, genes.use = PairNames)
 ```
 Next we run PCA. This generates however many principal components that you want. The basic idea is to reduce the ~hundreds of PairNames down to fewer dimensions for clustering. For this dataset we used 20, but these should be determined empirically through trial and testing.
 
 For this, we also use all PairNames as variable features, minus those from Probe 11 (which had poor detection in the dataset). Including 11 leads to weird clustering.
 
 ```{r}
+# VariableFeatures <- PairNames # If using all pair names (including with probe 11)
 VariableFeatures <- as.vector(PairNames[!(PairNames %in% PairNames[grep("11", PairNames)])])
 
 chromo.wt <- RunPCA(object = chromo.wt, features = VariableFeatures, do.print = TRUE, pcs.print = 1:5, genes.print = 5, pcs.compute = 50)
@@ -142,6 +170,8 @@ chromo.wt <- FindClusters(object = chromo.wt, resolution = 1.0, random.seed = 0)
 chromo.wt <- FindClusters(object = chromo.wt, resolution = 1.5, random.seed = 0)
 chromo.wt <- FindClusters(object = chromo.wt, resolution = 2.0, random.seed = 0)
 chromo.wt <- FindClusters(object = chromo.wt, resolution = 2.5, random.seed = 0)
+
+head(chromo.wt@meta.data)
 ```
 
 Next we calculate tSNE and UMAP embeddings for plotting. These are alternative dimensionality reduction techniques (a la PCA), and are only used for visualization, not clustering. Clustering is done in high dimensional PCA space.
@@ -179,7 +209,7 @@ chromo_age <- DimPlot(object = chromo.wt, group.by = "chromosome_age", reduction
 chromo_batch <- DimPlot(object = chromo.wt, group.by = "batch", reduction = "tsne", label = F, pt.size = 1) + ggtitle("Batch date") + theme(plot.title = element_text(hjust = 0.5))
 
 # use patchwork package to plot them together
-chromo_res.0.5 + chromo_res.1.0 + chromo_res.2.0 + chromo_age + chromo_batch + plot_layout(ncol = 2, widths = )
+chromo_res.0.5 + chromo_res.1.0 + chromo_res.2.0 + chromo_age + chromo_batch + plot_layout(ncol = 2)
 
 ```
 
@@ -210,5 +240,13 @@ We have to modify the files a bit so that they work with your Matlab scripts:
 meta.data <- chromo.wt@meta.data[, grep("res.", colnames(chromo.wt@meta.data))]
 rownames(meta.data) <- str_sub(rownames(meta.data), start = 15) # remove excess info from rownames so that they match Matlab scripts
 write.csv(meta.data, file = "Chromosome_5_wt_clustering-results.csv") # saves in current directory
+```
+
+
+And finally, save the seurat object
+```{r}
+saveRDS(chromo.wt, file = "chromosome_5_wt.rds")
+
+# chromo.wt <- readRDS(file = "chromosome_5_wt.rds")
 ```
 
